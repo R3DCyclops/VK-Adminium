@@ -320,10 +320,24 @@ class PosterWorker(QThread):
 
                         return media_id
                     except Exception as e:
-                        self.log_signal.emit(f"🧰[ERROR] Ошибка при обработке файла '{photo_file}': {e}")
+                        error_str = str(e)
+                        self.log_signal.emit(f"🧰[ERROR] Ошибка при обработке файла '{photo_file}': {error_str}")
+
+                        #перемещение при ошибке 100
+                        if "[100]" in error_str and "photo is undefined" in error_str:
+                            try:
+                                failed_folder = os.path.join(self.folder_path, "failed")
+                                os.makedirs(failed_folder, exist_ok=True)
+                                failed_path = os.path.join(failed_folder, photo_file)
+                                if os.path.exists(full_path):
+                                    shutil.move(full_path, failed_path)
+                                    self.log_signal.emit(f"[⚠️] Файл '{photo_file}' перемещён в 'failed' (photo is undefined).")
+                            except Exception as move_err:
+                                self.log_signal.emit(f"🧰[ERROR] Не удалось переместить в 'failed': {move_err}")
+
                         return None
 
-                with ThreadPoolExecutor(max_workers=2) as executor:
+                with ThreadPoolExecutor(max_workers=1) as executor:
                     results = list(executor.map(upload_single_photo, photo_batch))
                     media_ids = [result for result in results if result is not None]
                     
@@ -385,15 +399,17 @@ class PosterWorker(QThread):
             try:
                 with open(photo_path, 'rb') as f:
                     files = {'photo': f}
-                    response = requests.post(server['upload_url'], files=files, timeout=10)
-
-                if not response.text:
+                    response = requests.post(server['upload_url'], files=files, timeout=15)
+                
+                text = response.text.strip()
+                if not text:
                     raise Exception("Получен пустой ответ от сервера")
 
-                try:
-                    result = response.json()
-                except json.JSONDecodeError:
-                    raise Exception(f"Не удалось декодировать JSON: {response.text[:500]}...")
+                #Проверка: пришёл ли HTML вместо JSON
+                if text.startswith('<!DOCTYPE') or '<html' in text.lower():
+                    raise Exception("Ошибка HTML: сервер временно недоступен")
+
+                result = response.json()
 
                 if "error" in result:
                     raise Exception(f"Ошибка от ВК: {result['error']}")
@@ -403,7 +419,7 @@ class PosterWorker(QThread):
             except Exception as e:
                 self.log_signal.emit(f"[🔄] Ошибка загрузки {photo_path} (попытка {attempt + 1}/3): {e}")
                 if attempt < 2:
-                    time.sleep(2)
+                    time.sleep(2 + attempt * 2)  #прогрессивная задержка: 2, 4, ...
                 else:
                     raise
 
