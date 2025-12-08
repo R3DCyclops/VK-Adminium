@@ -12,6 +12,7 @@ PACKAGES = [
     "selenium",
     "beautifulsoup4",
     "PySide6"
+    "mistralai"
 ]
 
 def install_packages(packages):

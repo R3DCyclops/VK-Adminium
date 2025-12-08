@@ -22,14 +22,12 @@ import numpy as np
 from sklearn.cluster import KMeans
 import imagehash
 
-# Selenium и зависимости
 import chromedriver_autoinstaller
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from bs4 import BeautifulSoup
 from time import sleep
 
-# PySide6
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtWidgets import (
     QApplication, QWidget, QTabWidget, QLabel, QLineEdit, QPushButton,
@@ -61,21 +59,22 @@ def load_config():
         config["token"] = lines[0].strip() if len(lines) > 0 else ""
         config["group_id"] = lines[1].strip() if len(lines) > 1 else ""
         config["photos_per_post"] = lines[2].strip() if len(lines) > 2 else "9"
-        if len(lines) > 3:
-            config["last_post_time"] = int(round(float(lines[3].strip())))
+        config["mistral_api_key"] = lines[3].strip() if len(lines) > 3 else ""
+        if len(lines) > 4:
+            config["last_post_time"] = int(round(float(lines[4].strip())))
         else:
             config["last_post_time"] = None
     except Exception:
         return {}
     return config
 
-
-def save_config(token="", group_id="", photos_per_post="9", last_post_time=None):
+def save_config(token="", group_id="", photos_per_post="9", mistral_api_key="", last_post_time=None):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write(f"{token}\n")
             f.write(f"{group_id}\n")
             f.write(f"{photos_per_post}\n")
+            f.write(f"{mistral_api_key}\n")
             if last_post_time is not None:
                 f.write(f"{last_post_time}\n")
     except Exception as e:
@@ -204,9 +203,9 @@ class PosterWorker(QThread):
     log_signal = Signal(str)
     finished_signal = Signal()
     update_last_post_time = Signal(int)
-
     def __init__(self, token, group_id, interval_hours, folder_path, start_timestamp,
-                 photos_per_post, caption="", use_random_emoji=False, random_photos=False, emoji_list=None, use_carousel=False, cluster_mode=False):
+                 photos_per_post, caption="", use_random_emoji=False, random_photos=False, emoji_list=None, use_carousel=False, cluster_mode=False,
+                 use_ai_caption=False, mistral_api_key=""):
         super().__init__()
         self.token = token
         self.group_id = group_id
@@ -223,6 +222,9 @@ class PosterWorker(QThread):
         self.emoji_list = emoji_list or []
         self.use_carousel = use_carousel
         self.cluster_mode = cluster_mode
+        self.use_ai_caption = use_ai_caption
+        self.mistral_api_key = mistral_api_key
+        self.last_quotes = []
     
     def toggle_pause(self):
         with self.pause_cond:
@@ -370,10 +372,19 @@ class PosterWorker(QThread):
                 }
 
                 post_text = self.caption
+                if self.use_ai_caption:
+                    ai_quote = self.generate_ai_caption()
+                    if ai_quote:
+                        if post_text:
+                            post_text += f"\n\n{ai_quote}"
+                        else:
+                            post_text = ai_quote
                 if self.use_random_emoji and self.emoji_list:
                     emoji = random.choice(self.emoji_list)
-                    post_text += f"\n{emoji}"
-
+                    if post_text:
+                        post_text += f"\n{emoji}"
+                    else:
+                        post_text = emoji
                 if post_text.strip():
                     post_kwargs['message'] = post_text
 
@@ -381,7 +392,7 @@ class PosterWorker(QThread):
 
                 self.posts_saved += 1
                 self.update_last_post_time.emit(post_time)
-                save_config(self.token, self.group_id, self.photos_per_post, post_time)
+                save_config(self.token, self.group_id, self.photos_per_post, self.mistral_api_key, post_time)
                 time.sleep(delay_between_posts)
 
             except Exception as e:
@@ -389,6 +400,73 @@ class PosterWorker(QThread):
 
         self.log_signal.emit("[📝] 🧃 Все посты добавлены в отложку. Можешь пойти пить пиво.🍺")
         self.finished_signal.emit()
+        
+    def generate_ai_caption(self):
+        if not self.use_ai_caption or not self.mistral_api_key.strip():
+            return ""
+        from mistralai import Mistral
+        client = Mistral(api_key=self.mistral_api_key.strip())
+
+        banned_section = ""
+        if self.last_quotes:
+            banned_list = "\n".join(f"  - {q}" for q in self.last_quotes)
+            banned_section = (
+                "\n\nНЕ используй и не повторяй следующие цитаты (даже по смыслу или структуре):\n"
+                f"{banned_list}\n"
+            )
+        # ИИ промпт (Можно заменять по своему усмотрению. Может быть позже добавлю в UI)
+        base_prompt = (
+            "Мне нужны цитаты в стиле подростковых депрессивных пабликов ВКонтакте — короткие, острые, меланхоличные, "
+            "сырого и немного наивного отчаяния. Они должны звучать как обрывки мыслей, вырванные из контекста, будто "
+            "кто-то записал их в блокноте или на полях учебника.\n\n"
+            "Ключевые требования:\n"
+            "1. Эмоциональная насыщенность — боль, пустота, одиночество — но без диагнозов.\n"
+            "2. Краткость — 1–2 предложения, максимум 3.\n"
+            "3. Стиль: обрывки монолога, без логики между ними.\n"
+            "4. Подростковая наивность: крик души, а не философия.\n"
+            "5. Никаких имён, мест, событий. Только чувства и абстракции.\n"
+            "6. Подходит под ч/б фото: дождь, улицы, силуэты, пустые комнаты.\n\n"
+            "Мне нужна 1 цитата. И только она.\n"
+            "Экранируй её в три восклицательных знака: !!! текст !!!"
+        )
+
+        full_prompt = base_prompt + banned_section
+        messages = [{"role": "user", "content": full_prompt}]
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.log_signal.emit("[🧠] Запрос к Mistral AI за подписью...")
+                response = client.chat.complete(
+                    model="mistral-large-latest",
+                    messages=messages,
+                    max_tokens=150,
+                    temperature=0.85
+                )
+                raw_text = response.choices[0].message.content.strip()
+
+                if "!!!" in raw_text:
+                    parts = raw_text.split("!!!")
+                    if len(parts) >= 3:
+                        quote = parts[1].strip()
+                        if quote:
+                            if quote not in self.last_quotes:
+                                self.last_quotes.append(quote)
+                                if len(self.last_quotes) > 6:
+                                    self.last_quotes.pop(0)
+                            self.log_signal.emit(f"[🧠] Получена подпись: {quote}")
+                            return quote
+
+                self.log_signal.emit("[🧠] Подпись не найдена в нужном формате (Жаль).")
+                return ""
+            except Exception as e:
+                self.log_signal.emit(f"[🔄] Ошибка Mistral (попытка {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                else:
+                    self.log_signal.emit("[❌] Все попытки исчерпаны. Пропускаю ИИ подпись.")
+                    return ""
+        return ""
     
     def upload_photo(self, server, photo_path):
         import requests
@@ -1415,6 +1493,27 @@ class VKAutoPosterApp(QWidget):
         
         self.cluster_mode_checkbox = QCheckBox("Кол-во фото по соответствию кластеру")
         left_layout.addWidget(self.cluster_mode_checkbox)
+        
+        ai_caption_layout = QHBoxLayout()
+        self.ai_caption_checkbox = QCheckBox()
+        ai_caption_label = QLabel("ИИ подписи <b>(BETA)</b>")
+        ai_caption_label.setTextFormat(Qt.RichText)  #Включаем HTML-поддержку
+        ai_caption_layout.addWidget(self.ai_caption_checkbox)
+        ai_caption_layout.addWidget(ai_caption_label)
+        ai_caption_layout.addStretch()
+        left_layout.addLayout(ai_caption_layout)
+
+        self.mistral_token_input = QLineEdit(config.get("mistral_api_key", ""))
+
+        mistral_label = QLabel()
+        mistral_label.setText(
+            '<a href="https://console.mistral.ai/home" style="color: #668eff; text-decoration: none;">Mistral API</a> ключ (для ИИ подписей):'
+        )
+        mistral_label.setOpenExternalLinks(False)
+        mistral_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(QtCore.QUrl(link)))
+
+        left_layout.addWidget(mistral_label)
+        left_layout.addWidget(self.mistral_token_input)
 
         def toggle_photos_input():
             enabled = not (self.random_photos_checkbox.isChecked() or self.cluster_mode_checkbox.isChecked())
@@ -2510,20 +2609,24 @@ class VKAutoPosterApp(QWidget):
             else:
                 start_timestamp = int(time.time())
 
-        save_config(token, group_id, photos_per_post, None)
-
-        self.run_button.setEnabled(False)
-        self.pause_button.setEnabled(True)
         caption = self.caption_input.text().strip()
         use_random_emoji = self.random_emoji_checkbox.isChecked()
         random_photos = self.random_photos_checkbox.isChecked()
         use_carousel = self.carousel_checkbox.isChecked()
         cluster_mode = self.cluster_mode_checkbox.isChecked()
+        use_ai_caption = self.ai_caption_checkbox.isChecked()
+        mistral_api_key = self.mistral_token_input.text().strip()
+
+        save_config(token, group_id, photos_per_post, mistral_api_key, None)
+
+        self.run_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
 
         self.worker = PosterWorker(
             token, group_id, interval_hours, folder_path, start_timestamp,
             photos_per_post, caption, use_random_emoji, random_photos, self.emoji_list,
-            use_carousel=use_carousel, cluster_mode=cluster_mode
+            use_carousel=use_carousel, cluster_mode=cluster_mode,
+            use_ai_caption=use_ai_caption, mistral_api_key=mistral_api_key
         )
         self.worker.log_signal.connect(self.append_log)
         self.worker.finished_signal.connect(lambda: self.run_button.setEnabled(True))
