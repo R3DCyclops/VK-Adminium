@@ -36,6 +36,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import base64
+
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -44,42 +49,104 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+def derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+    )
+    return kdf.derive(password.encode())
+
+def encrypt_data(data: str, password: str) -> str:
+    salt = os.urandom(16)
+    key = derive_key(password, salt)
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(data.encode()) + encryptor.finalize()
+    return base64.b64encode(salt + iv + ciphertext).decode()
+
+def decrypt_data(encrypted_data: str, password: str) -> str:
+    data = base64.b64decode(encrypted_data.encode())
+    salt, iv, ciphertext = data[:16], data[16:32], data[32:]
+    key = derive_key(password, salt)
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    return plaintext.decode()
 
 CONFIG_PATH = os.path.join(os.path.dirname(sys.argv[0]), "last_settings.cfg")
-
 
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         return {}
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    config = {}
     try:
-        config["token"] = lines[0].strip() if len(lines) > 0 else ""
-        config["group_id"] = lines[1].strip() if len(lines) > 1 else ""
-        config["photos_per_post"] = lines[2].strip() if len(lines) > 2 else "9"
-        config["mistral_api_key"] = lines[3].strip() if len(lines) > 3 else ""
-        if len(lines) > 4:
-            config["last_post_time"] = int(round(float(lines[4].strip())))
-        else:
-            config["last_post_time"] = None
-    except Exception:
-        return {}
-    return config
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            encrypted_content = f.read().strip()
 
-def save_config(token="", group_id="", photos_per_post="9", mistral_api_key="", last_post_time=None):
+        CONFIG_SECRET = "14VKadminium88"  #Рекомендую заменить на что-то своё
+        content = decrypt_data(encrypted_content, CONFIG_SECRET)
+
+        config = {
+            "token": "",
+            "group_id": "",
+            "last_post_time": None,
+            "mistral_api_key": "",
+            "ai_prompt": ""
+        }
+
+        lines = content.split("\n")
+        if len(lines) > 0:
+            config["token"] = lines[0]
+        if len(lines) > 1:
+            config["group_id"] = lines[1]
+        if len(lines) > 2 and lines[2].strip():
+            try:
+                config["last_post_time"] = int(lines[2])
+            except (ValueError, TypeError):
+                pass
+        if len(lines) > 3:
+            config["mistral_api_key"] = lines[3]
+
+        start_marker = "!n!"
+        end_marker = "!n!"
+        start_idx = content.find(start_marker)
+        if start_idx != -1:
+            end_idx = content.rfind(end_marker)
+            if end_idx != -1 and end_idx > start_idx + len(start_marker):
+                prompt_raw = content[start_idx + len(start_marker):end_idx]
+                config["ai_prompt"] = prompt_raw
+
+        return config
+    except Exception as e:
+        print(f"🧰[ERROR] Не удалось загрузить конфиг: {e}")
+        return {}
+
+def save_config(token="", group_id="", mistral_api_key="", last_post_time=None, ai_prompt=""):
     try:
+        if last_post_time is None:
+            current = load_config()
+            last_post_time = current.get("last_post_time")
+            if last_post_time is None:
+                last_post_time = int(time.time())
+        config_str = "\n".join([
+            token,
+            group_id,
+            str(last_post_time),
+            mistral_api_key,
+        ]) + "\n"
+        if ai_prompt:
+            config_str += "!n!" + ai_prompt + "!n!\n"
+
+        CONFIG_SECRET = "14VKadminium88"  #Рекомендую заменить на что-то своё
+        encrypted = encrypt_data(config_str, CONFIG_SECRET)
+
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(f"{token}\n")
-            f.write(f"{group_id}\n")
-            f.write(f"{photos_per_post}\n")
-            f.write(f"{mistral_api_key}\n")
-            if last_post_time is not None:
-                f.write(f"{last_post_time}\n")
+            f.write(encrypted)
     except Exception as e:
         print(f"🧰[ERROR] Не удалось сохранить конфиг: {e}")
-
 
 class DuplicateWorker(QThread):
     log_signal = Signal(str)
@@ -93,8 +160,8 @@ class DuplicateWorker(QThread):
         self.processed = 0
 
     def run(self):
-        exact_hashes = {}  # MD5 > путь
-        phash_dict = {}    # phash > список путей
+        exact_hashes = {}  #MD5 > путь
+        phash_dict = {}    #phash > список путей
 
         exact_duplicates = []
         soft_duplicates = []
@@ -112,7 +179,7 @@ class DuplicateWorker(QThread):
         self.log_signal.emit(f"🔎[DEBUG] Начинаю поиск дубликатов в папке: {self.folder}")
         self.log_signal.emit(f"😱😱😱[FOUND] Обнаружено изображений: {self.total_files}")
 
-        # Точный поиск
+        #Точный поиск
         self.log_signal.emit("[1/2] Поиск точных дубликатов...")
         for root, _, files in os.walk(self.folder):
             for file in files:
@@ -205,7 +272,7 @@ class PosterWorker(QThread):
     update_last_post_time = Signal(int)
     def __init__(self, token, group_id, interval_hours, folder_path, start_timestamp,
                  photos_per_post, caption="", use_random_emoji=False, random_photos=False, emoji_list=None, use_carousel=False, cluster_mode=False,
-                 use_ai_caption=False, mistral_api_key=""):
+                 use_ai_caption=False, mistral_api_key="", ai_custom_prompt=""):
         super().__init__()
         self.token = token
         self.group_id = group_id
@@ -225,6 +292,18 @@ class PosterWorker(QThread):
         self.use_ai_caption = use_ai_caption
         self.mistral_api_key = mistral_api_key
         self.last_quotes = []
+        self.ai_custom_prompt = ai_custom_prompt or (
+            "Мне нужны цитаты в стиле подростковых депрессивных пабликов ВКонтакте — короткие, острые, меланхоличные, "
+            "сырого и немного наивного отчаяния. Они должны звучать как обрывки мыслей, вырванные из контекста, будто "
+            "кто-то записал их в блокноте или на полях учебника.\n\n"
+            "Ключевые требования:\n"
+            "1. Эмоциональная насыщенность — боль, пустота, одиночество — но без диагнозов.\n"
+            "2. Краткость — 1–2 предложения, максимум 3.\n"
+            "3. Стиль: обрывки монолога, без логики между ними.\n"
+            "4. Подростковая наивность: крик души, а не философия.\n"
+            "5. Никаких имён, мест, событий. Только чувства и абстракции.\n"
+            "6. Подходит под ч/б фото: дождь, улицы, силуэты, пустые комнаты."
+        )
     
     def toggle_pause(self):
         with self.pause_cond:
@@ -262,7 +341,7 @@ class PosterWorker(QThread):
         self.log_signal.emit(f"[🔎] Найдено {len(photos)} изображений для публикации.")
 
         if self.cluster_mode:
-            # группировка по кластерам, имена типа "123_4.jpg"
+            #группировка по кластерам, имена типа "123_4.jpg"
             from collections import defaultdict
             clusters = defaultdict(list)
             valid_photos = []
@@ -274,7 +353,7 @@ class PosterWorker(QThread):
                     valid_photos.append(photo)
                 else:
                     self.log_signal.emit(f"⚠️🧰[SKIP] Пропущено (не по шаблону кластера): {photo}")
-            # сортировка кластеров по номерам
+            #сортировка кластеров по номерам
             sorted_clusters = sorted(clusters.items(), key=lambda x: int(x[0]))
             batches = [batch for _, batch in sorted_clusters]
             self.log_signal.emit(f"[🧩] Режим кластеров: найдено {len(batches)} кластеров.")
@@ -392,7 +471,13 @@ class PosterWorker(QThread):
 
                 self.posts_saved += 1
                 self.update_last_post_time.emit(post_time)
-                save_config(self.token, self.group_id, self.photos_per_post, self.mistral_api_key, post_time)
+                save_config(
+                    token=self.token,
+                    group_id=self.group_id,
+                    mistral_api_key=self.mistral_api_key,
+                    last_post_time=post_time,
+                    ai_prompt=self.ai_custom_prompt
+                )
                 time.sleep(delay_between_posts)
 
             except Exception as e:
@@ -414,23 +499,10 @@ class PosterWorker(QThread):
                 "\n\nНЕ используй и не повторяй следующие цитаты (даже по смыслу или структуре):\n"
                 f"{banned_list}\n"
             )
-        # ИИ промпт (Можно заменять по своему усмотрению. Может быть позже добавлю в UI)
-        base_prompt = (
-            "Мне нужны цитаты в стиле подростковых депрессивных пабликов ВКонтакте — короткие, острые, меланхоличные, "
-            "сырого и немного наивного отчаяния. Они должны звучать как обрывки мыслей, вырванные из контекста, будто "
-            "кто-то записал их в блокноте или на полях учебника.\n\n"
-            "Ключевые требования:\n"
-            "1. Эмоциональная насыщенность — боль, пустота, одиночество — но без диагнозов.\n"
-            "2. Краткость — 1–2 предложения, максимум 3.\n"
-            "3. Стиль: обрывки монолога, без логики между ними.\n"
-            "4. Подростковая наивность: крик души, а не философия.\n"
-            "5. Никаких имён, мест, событий. Только чувства и абстракции.\n"
-            "6. Подходит под ч/б фото: дождь, улицы, силуэты, пустые комнаты.\n\n"
-            "Мне нужна 1 цитата. И только она.\n"
-            "Экранируй её в три восклицательных знака: !!! текст !!!"
-        )
 
-        full_prompt = base_prompt + banned_section
+        #Получаем пользовательский промпт (он должен быть передан в worker)
+        technical_suffix = "\n\nЭкранируй её в три восклицательных знака: !!! текст !!!"
+        full_prompt = self.ai_custom_prompt + technical_suffix + banned_section
         messages = [{"role": "user", "content": full_prompt}]
 
         max_retries = 3
@@ -497,7 +569,7 @@ class PosterWorker(QThread):
             except Exception as e:
                 self.log_signal.emit(f"[🔄] Ошибка загрузки {photo_path} (попытка {attempt + 1}/3): {e}")
                 if attempt < 2:
-                    time.sleep(2 + attempt * 2)  #прогрессивная задержка: 2, 4, ...
+                    time.sleep(2 + attempt * 2)  #прогрессивная задержка: 2, 4, и тд
                 else:
                     raise
 
@@ -554,9 +626,9 @@ class BimboSorterWorker(QThread):
                 colors.append(color)
                 self.log_signal.emit(f"💅[PROGRESS] Обработано {i + 1}/{len(image_paths)} изображений")
 
-            # Кластеризация по цвету
+            #Кластеризация по цвету
             if self.auto_distribute:
-                n_clusters = max(1, (len(images) + 8) // 9)  # округление вверх
+                n_clusters = max(1, (len(images) + 8) // 9)  #округление вверх
             else:
                 n_clusters = max(1, (len(images) + self.max_per_cluster - 1) // self.max_per_cluster)
 
@@ -567,13 +639,13 @@ class BimboSorterWorker(QThread):
             for img, label in zip(images, labels):
                 grouped[label].append(img)
 
-            # Формирование final_groups
+            #Формирование final_groups
             final_groups = []
             if self.auto_distribute:
                 for group in grouped:
                     for i in range(0, len(group), 9):
                         chunk = group[i:i + 9]
-                        final_groups.append(chunk)  # даже если <9, добавляем
+                        final_groups.append(chunk)  #даже если <9, добавляем
                 self.log_signal.emit(f"🧩[AUTO] Разбито на {len(final_groups)} подкластеров (макс. 9 на кластер).")
             else:
                 sorted_images = []
@@ -587,7 +659,7 @@ class BimboSorterWorker(QThread):
                     else:
                         incomplete_group = chunk
 
-            # Перемещение в 'check', только если НЕ автораспределение
+            #Перемещение в 'check', только если НЕ автораспределение
             if not self.auto_distribute:
                 if len(incomplete_group) > 0:
                     check_folder = os.path.join(self.folder_path, 'check')
@@ -611,7 +683,7 @@ class BimboSorterWorker(QThread):
             else:
                 self.log_signal.emit("🧩[AUTO] Режим автораспределения: пропускаю перемещение в 'check'.")
 
-            # Переименование всех файлов из final_groups
+            #Переименование всех файлов из final_groups
             renamed_count = 0
             new_names_log = []
             for group_idx, group in enumerate(final_groups):
@@ -683,11 +755,25 @@ class WatermarkWorker(QThread):
             alpha = alpha.point(lambda p: p * opacity_factor)
             watermark.putalpha(alpha)
 
+            margin = int(self.size * 0.2) #20 проц от текущего размера вотермарки
+            #Ограничение отступа, если изображение меньше вотермарки
             pos_map = {
-                "top-left": (0, 0),
-                "top-right": lambda img_w, wm_w: (img_w - wm_w, 0),
-                "bottom-left": lambda img_w, wm_w: (0, img_w - wm_w),
-                "bottom-right": lambda img_w, wm_w: (img_w - wm_w, img_w - wm_w),
+                "top-left": lambda img_w, img_h, wm_w, wm_h: (
+                    max(0, margin),
+                    max(0, margin)
+                ),
+                "top-right": lambda img_w, img_h, wm_w, wm_h: (
+                    max(0, img_w - wm_w - margin),
+                    max(0, margin)
+                ),
+                "bottom-left": lambda img_w, img_h, wm_w, wm_h: (
+                    max(0, margin),
+                    max(0, img_h - wm_h - margin)
+                ),
+                "bottom-right": lambda img_w, img_h, wm_w, wm_h: (
+                    max(0, img_w - wm_w - margin),
+                    max(0, img_h - wm_h - margin)
+                ),
             }
 
             supported_extensions = ('.png', '.jpg', '.jpeg', '.bmp')
@@ -703,11 +789,12 @@ class WatermarkWorker(QThread):
                 try:
                     self.log_signal.emit(f"[🖋️] Обработка файла: {filename}")
                     base_image = Image.open(full_path).convert("RGBA")
-                    pos_func = pos_map[self.position]
-                    if isinstance(pos_func, tuple):
-                        position_coords = pos_func
-                    else:
-                        position_coords = pos_func(base_image.width, watermark.width)
+                    position_coords = pos_map[self.position](
+                        base_image.width,
+                        base_image.height,
+                        watermark.width,
+                        watermark.height
+                    )
 
                     base_image.paste(watermark, position_coords, watermark)
                     base_image = base_image.convert("RGB") if filename.lower().endswith(('.jpg', '.jpeg')) else base_image
@@ -867,7 +954,7 @@ class Pinterest:
         options.add_experimental_option("excludeSwitches", ["enable-logging"])
         self.driver = webdriver.Chrome(options=options)
 
-        # попытка входа через куки
+        #попытка входа через куки
         if os.path.exists("cookies.pkl"):
             self.log("🍪[LOADING] Загружаю cookies...")
             self.driver.get("https://pinterest.com")
@@ -890,15 +977,15 @@ class Pinterest:
                 sleep(2)
                 if self._is_logged_in():
                     self.log("🍪[SUCCESS] Успешный вход через cookies.")
-                    return  # выходим, если cookies сработали
+                    return  #выходим, если cookies сработали
             except Exception as e:
                 self.log(f"💔[ERROR] Ошибка загрузки cookies: {e}")
 
-        # если куки не сработали, требуем логин/пароль
+        #если куки не сработали, требуем логин/пароль
         if not login or not pw:
             raise Exception("💔[ERROR] Требуется email и пароль (cookies недействительны или отсутствуют).")
 
-        # ручной вход
+        #ручной вход
         self.log("Выполняется вход в аккаунт...")
         self.driver.get("https://pinterest.com/login")
         sleep(2)
@@ -989,7 +1076,7 @@ class Pinterest:
             if not src or "75x75_RS" in src:
                 continue
 
-            # замена превью на оригинал
+            #замена превью на оригинал
             original_src = (
                 src
                 .replace("/236x/", "/originals/")
@@ -1082,7 +1169,7 @@ class AlbumDownloaderWorker(QThread):
             os.makedirs(folder_path, exist_ok=True)
             self.log_signal.emit(f"📁[INFO] Сохраняю в папку: {folder_path}")
 
-            # Запуск сканера в отдельном потоке
+            #Запуск сканера в отдельном потоке
             self.stop_flag = False
             self.scanner_thread = Thread(
                 target=self.scanner_task,
@@ -1091,8 +1178,8 @@ class AlbumDownloaderWorker(QThread):
             )
             self.scanner_thread.start()
 
-            # Запуск нескольких загрузчиков
-            for _ in range(3):  # 3 потока для скачивания
+            #Запуск нескольких загрузчиков
+            for _ in range(3):  #3 потока для скачивания
                 downloader = Thread(
                     target=self.downloader_task,
                     args=(folder_path,),
@@ -1241,11 +1328,11 @@ class VKWorker(QThread):
                     break
                 members.extend(items)
                 offset += count
-                self.msleep(300)  # анти-спам задержка
+                self.msleep(300)  #анти-спам задержка
 
             self.log_signal.emit(f"🔍👽[SUCCESS] Найдено {len(members)} участников.")
 
-            # Проверка статусов
+            #Проверка статусов
             for i in range(0, len(members), 200):
                 batch = members[i:i + 200]
                 user_info = vk.users.get(user_ids=",".join(map(str, batch)))
@@ -1255,7 +1342,7 @@ class VKWorker(QThread):
                         self.log_signal.emit(f"☠[DEBUG] Заблокирован/удалён: {u['id']} | {u.get('deactivated', 'unknown')}")
                 self.msleep(300)
 
-            # Действие от режима
+            #Действие от режима
             if self.action == "scan":
                 self.result_signal.emit(self.blocked_users)
 
@@ -1329,7 +1416,7 @@ class VKAutoPosterApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VK Adminium")
-        self.resize(1350, 550)
+        self.resize(1350, 650)
         icon_path = resource_path("ico.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QtGui.QIcon(icon_path))
@@ -1408,6 +1495,14 @@ class VKAutoPosterApp(QWidget):
             QPushButton#pause_button[paused="true"]:hover {
                 background-color: #cc3333;
             }
+            QPushButton#eyeButton {
+                background-color: transparent;
+                border: none;
+                padding: 0;
+                margin: 0;
+                font-size: 16px;
+                color: white;
+            }
         """)
         self.init_ui()
         
@@ -1436,24 +1531,99 @@ class VKAutoPosterApp(QWidget):
             "⛺", "⛲", "🕋", "⛩", "🎠", "🎡", "🎇", "🎆", "🎃", "🎴",
             "🎛", "🚬", "🛒", "🚿", "🎱",
         ]
+        
+        config = load_config()
+        self.current_ai_prompt = config.get("ai_prompt", "").strip()
+        if not self.current_ai_prompt:
+            self.current_ai_prompt = (
+                "Мне нужны цитаты в стиле подростковых депрессивных пабликов ВКонтакте — короткие, острые, меланхоличные, "
+                "сырого и немного наивного отчаяния. Они должны звучать как обрывки мыслей, вырванные из контекста, будто "
+                "кто-то записал их в блокноте или на полях учебника.\n\n"
+                "Ключевые требования:\n"
+                "1. Эмоциональная насыщенность — боль, пустота, одиночество — но без диагнозов.\n"
+                "2. Краткость — 1–2 предложения, максимум 3.\n"
+                "3. Стиль: обрывки монолога, без логики между ними.\n"
+                "4. Подростковая наивность: крик души, а не философия.\n"
+                "5. Никаких имён, мест, событий. Только чувства и абстракции.\n"
+                "6. Подходит под ч/б фото: дождь, улицы, силуэты, пустые комнаты."
+            )
+            
+    def open_prompt_editor(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Редактор промпта ИИ")
+        dialog.setModal(True)
+        dialog.resize(600, 400)
+
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel("Введите промпт для генерации подписей:")
+        layout.addWidget(label)
+
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setPlainText(self.current_ai_prompt)
+        self.prompt_edit.setStyleSheet("""
+            background-color: #2e2e2e;
+            color: white;
+            border: 1px solid #555;
+            font-family: Consolas, monospace;
+        """)
+        layout.addWidget(self.prompt_edit)
+
+        apply_btn = QPushButton("Применить")
+        apply_btn.clicked.connect(lambda: self.save_custom_prompt(dialog))
+        layout.addWidget(apply_btn)
+
+        dialog.exec()
+        
+    def save_custom_prompt(self, dialog):
+        new_prompt = self.prompt_edit.toPlainText().strip()
+        if not new_prompt:
+            QMessageBox.warning(self, "Ошибка", "Промпт не может быть пустым.")
+            return
+
+        self.current_ai_prompt = new_prompt
+
+        token = self.token_input.text().strip()
+        group_id = self.group_input.text().strip()
+        mistral_api_key = self.mistral_token_input.text().strip()
+
+        save_config(
+            token=token,
+            group_id=group_id,
+            mistral_api_key=mistral_api_key,
+            last_post_time=None,
+            ai_prompt=self.current_ai_prompt
+        )
+        dialog.accept()
+            
 
     def init_ui(self):
         self.tabs = QTabWidget()
 
-        # Вкладка Adminium
         adminium_tab = QWidget()
         adminium_layout = QHBoxLayout()
         left_widget = QWidget()
         left_layout = QVBoxLayout()
         config = load_config()
 
-        self.token_input = QLineEdit(config.get("token", ""))
         token_label = QLabel()
         token_label.setText('<a href="https://vkhost.github.io/"  style="color: #668eff; text-decoration: none;">Токен API:</a>')
         token_label.setOpenExternalLinks(False)
         token_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(link))
         left_layout.addWidget(token_label)
-        left_layout.addWidget(self.token_input)
+
+        self.token_input = QLineEdit(config.get("token", ""))
+        self.token_input.setEchoMode(QLineEdit.Password)
+        token_eye_btn = QPushButton("👁️")
+        token_eye_btn.setObjectName("eyeButton")
+        token_eye_btn.setFixedSize(30, 30)
+        #token_eye_btn.setCursor(Qt.PointingHandCursor)
+        token_eye_btn.enterEvent = lambda e: self.token_input.setEchoMode(QLineEdit.Normal)
+        token_eye_btn.leaveEvent = lambda e: self.token_input.setEchoMode(QLineEdit.Password)
+        token_layout = QHBoxLayout()
+        token_layout.addWidget(self.token_input)
+        token_layout.addWidget(token_eye_btn)
+        left_layout.addLayout(token_layout)
 
         self.group_input = QLineEdit(config.get("group_id", ""))
         left_layout.addWidget(QLabel("Числовой ID сообщества|паблика:"))
@@ -1497,13 +1667,17 @@ class VKAutoPosterApp(QWidget):
         ai_caption_layout = QHBoxLayout()
         self.ai_caption_checkbox = QCheckBox()
         ai_caption_label = QLabel("ИИ подписи <b>(BETA)</b>")
-        ai_caption_label.setTextFormat(Qt.RichText)  #Включаем HTML-поддержку
+        ai_caption_label.setTextFormat(Qt.RichText)
         ai_caption_layout.addWidget(self.ai_caption_checkbox)
         ai_caption_layout.addWidget(ai_caption_label)
+
+        self.edit_prompt_label = QLabel('<a href="#" style="font-size: 70%; color: #668eff;">Редактировать промпт</a>')
+        self.edit_prompt_label.setOpenExternalLinks(False)
+        self.edit_prompt_label.linkActivated.connect(self.open_prompt_editor)
+        self.edit_prompt_label.setToolTip("Настроить промпт для генерации подписей")
+        ai_caption_layout.addWidget(self.edit_prompt_label)
         ai_caption_layout.addStretch()
         left_layout.addLayout(ai_caption_layout)
-
-        self.mistral_token_input = QLineEdit(config.get("mistral_api_key", ""))
 
         mistral_label = QLabel()
         mistral_label.setText(
@@ -1511,9 +1685,21 @@ class VKAutoPosterApp(QWidget):
         )
         mistral_label.setOpenExternalLinks(False)
         mistral_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(QtCore.QUrl(link)))
-
         left_layout.addWidget(mistral_label)
-        left_layout.addWidget(self.mistral_token_input)
+
+        self.mistral_token_input = QLineEdit(config.get("mistral_api_key", ""))
+        self.mistral_token_input.setEchoMode(QLineEdit.Password)
+        mistral_eye_btn = QPushButton("👁️")
+        mistral_eye_btn.setObjectName("eyeButton")
+        mistral_eye_btn.setFixedSize(30, 30)
+        #mistral_eye_btn.setCursor(Qt.PointingHandCursor)
+        mistral_eye_btn.enterEvent = lambda e: self.mistral_token_input.setEchoMode(QLineEdit.Normal)
+        mistral_eye_btn.leaveEvent = lambda e: self.mistral_token_input.setEchoMode(QLineEdit.Password)
+        mistral_layout = QHBoxLayout()
+        mistral_layout.addWidget(self.mistral_token_input)
+        mistral_layout.addWidget(mistral_eye_btn)
+        left_layout.addLayout(mistral_layout)
+        
 
         def toggle_photos_input():
             enabled = not (self.random_photos_checkbox.isChecked() or self.cluster_mode_checkbox.isChecked())
@@ -1562,7 +1748,8 @@ class VKAutoPosterApp(QWidget):
         self.pause_button.clicked.connect(self.toggle_pause)
         self.pause_button.setEnabled(False)
         left_layout.addWidget(self.pause_button)
-
+        
+        """
         self.logo_label = QLabel()
         logo_path = resource_path("bckg.png")
         if os.path.exists(logo_path):
@@ -1572,6 +1759,8 @@ class VKAutoPosterApp(QWidget):
             self.logo_label.setText("Лого не найдено")
         self.logo_label.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(self.logo_label)
+        
+        """
 
         left_layout.addStretch()
         left_widget.setLayout(left_layout)
@@ -1593,13 +1782,14 @@ class VKAutoPosterApp(QWidget):
         adminium_layout.addWidget(self.log_area)
         adminium_tab.setLayout(adminium_layout)
 
-        # Вкладка Watermark
+        #Вкладка Watermark
         watermark_tab = QWidget()
         wm_main_layout = QHBoxLayout(watermark_tab)
-
         wm_form_widget = QWidget()
         wm_form_widget.setFixedWidth(360)
         wm_form_layout = QVBoxLayout(wm_form_widget)
+        wm_form_layout.setSpacing(10)
+        wm_form_layout.setContentsMargins(10, 10, 10, 10)
 
         self.wm_folder = ""
         self.wm_label_folder = QLabel("Папка с изображениями: не выбрана")
@@ -1615,27 +1805,21 @@ class VKAutoPosterApp(QWidget):
         self.wm_btn_watermark.clicked.connect(self.select_wm_image)
         wm_form_layout.addWidget(self.wm_btn_watermark)
 
-        settings_layout = QHBoxLayout()
-
-        opacity_layout = QVBoxLayout()
+        #Непрозрачность
+        ##wm_form_layout.addWidget(QLabel("Непрозрачность (%)"))
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setMinimum(0)
         self.opacity_slider.setMaximum(100)
-        self.opacity_slider.setValue(32)  # стандартная прозрачность
+        self.opacity_slider.setValue(32)
         self.opacity_label = QLabel("Непрозрачность: 32%")
         self.opacity_slider.valueChanged.connect(lambda v: self.opacity_label.setText(f"Непрозрачность: {v}%"))
-        opacity_layout.addWidget(QLabel("Непрозрачность (%)"))
-        opacity_layout.addWidget(self.opacity_slider)
-        opacity_layout.addWidget(self.opacity_label)
-        settings_layout.addLayout(opacity_layout)
+        wm_form_layout.addWidget(self.opacity_slider)
+        wm_form_layout.addWidget(self.opacity_label)
 
-        size_layout = QVBoxLayout()
+        #Размер водяного знака
+        wm_form_layout.addWidget(QLabel("Размер водяного знака (px):"))
         self.size_input = QLineEdit("100")
-        size_layout.addWidget(QLabel("Размер водяного знака (px):"))
-        size_layout.addWidget(self.size_input)
-        settings_layout.addLayout(size_layout)
-
-        wm_form_layout.addLayout(settings_layout)
+        wm_form_layout.addWidget(self.size_input)
 
 
         position_group_box = QWidget()
@@ -1695,10 +1879,10 @@ class VKAutoPosterApp(QWidget):
         self.wm_apply_button = QPushButton("Применить водяной знак")
         self.wm_apply_button.clicked.connect(self.apply_watermark)
         wm_form_layout.addWidget(self.wm_apply_button)
-
+        wm_form_layout.addStretch()
         wm_main_layout.addWidget(wm_form_widget, stretch=1)
 
-        # лог с фиксированной шириной
+        #лог с фиксированной шириной
         self.wm_log_area = QTextEdit()
         self.wm_log_area.setReadOnly(True)
         self.wm_log_area.setStyleSheet("""
@@ -1744,10 +1928,24 @@ class VKAutoPosterApp(QWidget):
         self.credits_ui(credits_tab)
         self.tabs.addTab(credits_tab, "Credits")
 
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # запрещаем гориз. скролл
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        #Вкладки становятся содержимым скролла
+        scroll.setWidget(self.tabs)
+
         main_layout = QVBoxLayout()
-        main_layout.addWidget(self.tabs)
+        main_layout.addWidget(scroll)
         self.setLayout(main_layout)
-        self.layout().setSizeConstraint(QVBoxLayout.SetFixedSize)
+
+        #Фиксируем ширину окна — как у вкладок
+        total_width = 360 + 450 + 70  #левая панель + лог + отступы
+        self.setFixedWidth(total_width)
+        
+        self.setMinimumHeight(300)
         
     def pin_downloader_ui(self, tab):
         layout = QHBoxLayout(tab)
@@ -1760,10 +1958,20 @@ class VKAutoPosterApp(QWidget):
         form_layout.addWidget(QLabel("Email:"))
         form_layout.addWidget(self.pin_email_input)
 
+        form_layout.addWidget(QLabel("Пароль:"))
+
         self.pin_password_input = QLineEdit()
         self.pin_password_input.setEchoMode(QLineEdit.Password)
-        form_layout.addWidget(QLabel("Пароль:"))
-        form_layout.addWidget(self.pin_password_input)
+        pin_eye_btn = QPushButton("👁️")
+        pin_eye_btn.setObjectName("eyeButton")
+        pin_eye_btn.setFixedSize(30, 30)
+        #pin_eye_btn.setCursor(Qt.PointingHandCursor)
+        pin_eye_btn.enterEvent = lambda e: self.pin_password_input.setEchoMode(QLineEdit.Normal)
+        pin_eye_btn.leaveEvent = lambda e: self.pin_password_input.setEchoMode(QLineEdit.Password)
+        pin_pass_layout = QHBoxLayout()
+        pin_pass_layout.addWidget(self.pin_password_input)
+        pin_pass_layout.addWidget(pin_eye_btn)
+        form_layout.addLayout(pin_pass_layout)
         
         hint_label = QLabel("Логин/пароль требуется только при первом входе")
         hint_label.setStyleSheet("""
@@ -1876,10 +2084,10 @@ class VKAutoPosterApp(QWidget):
             QMessageBox.warning(self, "Ошибка", "Укажи корректную папку загрузки.")
             return
 
-        # Проверка cookies
+        #Проверка cookies
         cookies_exist = os.path.exists("cookies.pkl")
 
-        # Если cookies есть, пропускаем логин\пароль
+        #Если cookies есть, пропускаем логин\пароль
         if not cookies_exist and (not email or not password):
             QMessageBox.warning(self, "Ошибка", "Введи email и пароль (cookies не найдены).")
             return
@@ -2057,7 +2265,7 @@ class VKAutoPosterApp(QWidget):
 
         form_widget.setFixedWidth(360)
 
-        # лог справа
+        #лог справа
         self.bimbo_log_area = QTextEdit()
         self.bimbo_log_area.setReadOnly(True)
         self.bimbo_log_area.setStyleSheet("""
@@ -2142,7 +2350,7 @@ class VKAutoPosterApp(QWidget):
         form_layout.addStretch()
         form_widget.setFixedWidth(360)
 
-        # лог\консоль
+        #лог\консоль
         self.dup_log_area = QTextEdit()
         self.dup_log_area.setReadOnly(True)
         self.dup_log_area.setStyleSheet("""
@@ -2154,7 +2362,7 @@ class VKAutoPosterApp(QWidget):
         """)
         self.dup_log_area.setFixedWidth(450)
 
-        # Добавляем левую и правую части в общий layout
+        #Добавляем левую и правую части в общий layout
         layout.addWidget(form_widget)
         layout.addWidget(self.dup_log_area)
         
@@ -2239,7 +2447,7 @@ class VKAutoPosterApp(QWidget):
 
         self.avatar_label = QLabel()
         self.avatar_label.setFixedSize(300, 300)
-        self.avatar_label.setCursor(Qt.PointingHandCursor)  # Курсор в виде руки
+        self.avatar_label.setCursor(Qt.PointingHandCursor)
         avatar_path = resource_path("avatar1.png")
         if os.path.exists(avatar_path):
             pixmap = QtGui.QPixmap(avatar_path).scaled(
@@ -2323,20 +2531,31 @@ class VKAutoPosterApp(QWidget):
 
         config = load_config()
 
+        token_label = QLabel()
+        token_label.setText('<a href="https://vkhost.github.io/"  style="color: #668eff; text-decoration: none;">Токен API:</a>')
+        token_label.setOpenExternalLinks(False)
+        token_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(link))
+        form_layout.addWidget(token_label)
+
         self.cleaner_token_input = QLineEdit(config.get("token", ""))
+        self.cleaner_token_input.setEchoMode(QLineEdit.Password)
         self.cleaner_token_input.setStyleSheet("""
             background-color: #444;
             border: 1px solid #555;
             padding: 5px;
             color: white;
         """)
-        token_label = QLabel()
-        token_label.setText('<a href="https://vkhost.github.io/"  style="color: #668eff; text-decoration: none;">Токен API:</a>')
-        token_label.setOpenExternalLinks(False)
-        token_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(link))
-        form_layout.addWidget(token_label)
-        form_layout.addWidget(self.cleaner_token_input)
-
+        cleaner_eye_btn = QPushButton("👁️")
+        cleaner_eye_btn.setObjectName("eyeButton")
+        cleaner_eye_btn.setFixedSize(30, 30)
+        #cleaner_eye_btn.setCursor(Qt.PointingHandCursor)
+        cleaner_eye_btn.enterEvent = lambda e: self.cleaner_token_input.setEchoMode(QLineEdit.Normal)
+        cleaner_eye_btn.leaveEvent = lambda e: self.cleaner_token_input.setEchoMode(QLineEdit.Password)
+        cleaner_layout = QHBoxLayout()
+        cleaner_layout.addWidget(self.cleaner_token_input)
+        cleaner_layout.addWidget(cleaner_eye_btn)
+        form_layout.addLayout(cleaner_layout)
+        
         self.cleaner_group_input = QLineEdit(config.get("group_id", ""))
         self.cleaner_group_input.setStyleSheet("""
             background-color: #444;
@@ -2354,7 +2573,7 @@ class VKAutoPosterApp(QWidget):
         form_layout.addWidget(self.scan_button)
         form_layout.addWidget(self.clear_button)
 
-        form_layout.addStretch()  # Заберёт всё свободное место
+        form_layout.addStretch()  #Заберёт всё свободное место
 
         dog_label = QLabel()
         dog_path = resource_path("dog.png")
@@ -2585,7 +2804,7 @@ class VKAutoPosterApp(QWidget):
             QMessageBox.critical(self, "Ошибка", "Укажите корректную папку с изображениями.")
             return
 
-        # Создаём папку posted внутри выбранной папки
+        #Создаём папку posted внутри выбранной папки
         posted_folder = os.path.join(folder_path, "posted")
         if not os.path.exists(posted_folder):
             try:
@@ -2617,7 +2836,13 @@ class VKAutoPosterApp(QWidget):
         use_ai_caption = self.ai_caption_checkbox.isChecked()
         mistral_api_key = self.mistral_token_input.text().strip()
 
-        save_config(token, group_id, photos_per_post, mistral_api_key, None)
+        save_config(
+            token=token,
+            group_id=group_id,
+            mistral_api_key=mistral_api_key,
+            last_post_time=None,
+            ai_prompt=self.current_ai_prompt
+        )
 
         self.run_button.setEnabled(False)
         self.pause_button.setEnabled(True)
@@ -2626,7 +2851,8 @@ class VKAutoPosterApp(QWidget):
             token, group_id, interval_hours, folder_path, start_timestamp,
             photos_per_post, caption, use_random_emoji, random_photos, self.emoji_list,
             use_carousel=use_carousel, cluster_mode=cluster_mode,
-            use_ai_caption=use_ai_caption, mistral_api_key=mistral_api_key
+            use_ai_caption=use_ai_caption, mistral_api_key=mistral_api_key,
+            ai_custom_prompt=self.current_ai_prompt
         )
         self.worker.log_signal.connect(self.append_log)
         self.worker.finished_signal.connect(lambda: self.run_button.setEnabled(True))

@@ -11,8 +11,9 @@ PACKAGES = [
     "chromedriver-autoinstaller",
     "selenium",
     "beautifulsoup4",
-    "PySide6"
-    "mistralai"
+    "PySide6",
+    "mistralai",
+    "cryptography"
 ]
 
 def install_packages(packages):

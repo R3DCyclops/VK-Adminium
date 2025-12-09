@@ -30,7 +30,8 @@ for name, path in required_files.items():
 
 command = [
     'pyinstaller',
-    '--onefile',
+    '--onedir',
+    '--contents-directory', 'vkadata',
     '--windowed',
     '--icon', icon_path,
     '--distpath', output_dir,
