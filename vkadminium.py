@@ -75,6 +75,17 @@ def decrypt_data(encrypted_data: str, password: str) -> str:
     decryptor = cipher.decryptor()
     plaintext = decryptor.update(ciphertext) + decryptor.finalize()
     return plaintext.decode()
+    
+def get_normalized_image_hash(filepath):
+    #Возвращает MD5 от нормализованного изображения 128x128, для поиска точных визуальных дубликатов
+    try:
+        img = Image.open(filepath)
+        img = img.resize((128, 128))
+        img = img.convert("RGB")
+        data = img.tobytes()
+        return md5(data).hexdigest()
+    except Exception:
+        return None
 
 CONFIG_PATH = os.path.join(os.path.dirname(sys.argv[0]), "last_settings.cfg")
 
@@ -185,7 +196,7 @@ class DuplicateWorker(QThread):
             for file in files:
                 if file.lower().endswith(image_extensions):
                     path = os.path.join(root, file)
-                    img_hash = self.get_image_hash(path)
+                    img_hash = get_normalized_image_hash(path)
                     if img_hash:
                         if img_hash in exact_hashes:
                             exact_duplicates.append(path)
@@ -246,20 +257,8 @@ class DuplicateWorker(QThread):
             message = f"💌[DONE] Итог: {self.processed} / {self.total_files_full} — 100%"
         self.log_signal.emit(message)
 
-    def get_image_hash(self, filepath):
-        """MD5 хэш содержимого файла (для точного сравнения)"""
-        try:
-            img = Image.open(filepath)
-            img = img.resize((128, 128))
-            img = img.convert("RGB")
-            data = img.tobytes()
-            return md5(data).hexdigest()
-        except Exception as e:
-            self.log_signal.emit(f"🧰[ERROR] Ошибка при обработке {filepath}: {e}")
-            return None
-
     def get_phash(self, filepath):
-        """Perceptual hash изображения (для мягкого сравнения)"""
+        #Perceptual hash изображения для мягкого сравнения
         try:
             return imagehash.phash(Image.open(filepath))
         except Exception as e:
@@ -500,7 +499,7 @@ class PosterWorker(QThread):
                 f"{banned_list}\n"
             )
 
-        #Получаем пользовательский промпт (он должен быть передан в worker)
+        #Получаем пользовательский промпт, он должен быть передан в worker
         technical_suffix = "\n\nЭкранируй её в три восклицательных знака: !!! текст !!!"
         full_prompt = self.ai_custom_prompt + technical_suffix + banned_section
         messages = [{"role": "user", "content": full_prompt}]
@@ -595,6 +594,378 @@ class PosterWorker(QThread):
             self.log_signal.emit(f"🧰[ERROR] Ошибка при загрузке {photo_file}: {e}")
             return None
             
+class AutobotWorker(QThread):
+    log_signal = Signal(str)
+    finished_signal = Signal()
+    def __init__(self, token, group_id, interval_hours, main_folder, pin_email, pin_password,
+                 caption, use_random_emoji, use_carousel, use_ai_caption, mistral_api_key, ai_prompt,
+                 wm_path, wm_opacity, wm_size, wm_position, wm_bw, emoji_list):
+        super().__init__()
+        self.token = token
+        self.group_id = group_id
+        self.interval_hours = interval_hours
+        self.main_folder = main_folder
+        self.pin_email = pin_email
+        self.pin_password = pin_password
+        self.caption = caption
+        self.use_random_emoji = use_random_emoji
+        self.use_carousel = use_carousel
+        self.use_ai_caption = use_ai_caption
+        self.mistral_api_key = mistral_api_key
+        self.ai_prompt = ai_prompt
+        self.wm_path = wm_path
+        self.wm_opacity = wm_opacity
+        self.wm_size = wm_size
+        self.wm_position = wm_position
+        self.wm_bw = wm_bw
+        self.emoji_list = emoji_list
+        self.running = True
+
+    def run(self):
+        self.log_signal.emit("🤖[Autobot] Запущен. Проверяю отложку каждые 5 часов...")
+        while self.running:
+            try:
+                delayed_count = self.check_delayed_count()
+                self.log_signal.emit(f"📨[Autobot] Текущая отложка: {delayed_count} постов")
+                if delayed_count < 50:
+                    self.run_autobot_cycle()
+                else:
+                    self.log_signal.emit("💤[Autobot] Отложка полная. Жду 5 часов...")
+                if self.running:
+                    time.sleep(18000)  #5 часов
+            except Exception as e:
+                self.log_signal.emit(f"🧰[ERROR] Ошибка в основном цикле: {e}")
+        self.log_signal.emit("🛑[Autobot] Остановлен.")
+        
+    def run_autobot_cycle(self):
+        self.log_signal.emit("🔄[Autobot] Запуск цикла обработки...")
+        main_folder = self.main_folder
+        posted_dir = os.path.join(main_folder, "posted")
+        autobot_pin_dir = os.path.join(main_folder, "autobotPin")
+        dupes_dir = os.path.join(main_folder, "dupes")
+
+        #1 Очистка папки posted/
+        if os.path.exists(posted_dir):
+            try:
+                shutil.rmtree(posted_dir)
+                os.makedirs(posted_dir)
+                self.log_signal.emit("🧹[Autobot] Папка 'posted' очищена.")
+            except Exception as e:
+                self.log_signal.emit(f"🧰[ERROR] Не удалось очистить 'posted': {e}")
+        else:
+            os.makedirs(posted_dir)
+
+        #2 Проверка количества изображений в main_folder
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
+        existing_files = [
+            f for f in os.listdir(main_folder)
+            if os.path.isfile(os.path.join(main_folder, f)) and f.lower().endswith(image_extensions)
+        ]
+        current_count = len(existing_files)
+        self.log_signal.emit(f"📊[Autobot] В папке {current_count} изображений.")
+
+        #3 Если <2500 - запускаем Pinterest в подпапку autobotPin/
+        if current_count < 2500:
+            need = 2500 - current_count
+            self.log_signal.emit(f"📥[Autobot] Требуется скачать ещё {need} изображений.")
+
+            #проверка подпапки
+            os.makedirs(autobot_pin_dir, exist_ok=True)
+
+            #Запуск Пинтерест через существующий метод
+            try:
+                self.log_signal.emit("🔑[Pinterest] Попытка входа через cookies...")
+                #Используем логику из класса Pinterest
+                pinterest = Pinterest(
+                    login=self.pin_email,
+                    pw=self.pin_password,
+                    headless=True,
+                    log_callback=lambda msg: self.log_signal.emit(f"[Pinterest] {msg}")
+                )
+
+                self.log_signal.emit("🌐[Pinterest] Начинаю загрузку с https://pinterest.com/...")
+                #Модифицируем single_download: останавливаем при достижении need
+                pinterest.driver.get("https://pinterest.com/")
+                time.sleep(3)
+
+                downloaded_count = 0
+                page = 0
+                while downloaded_count < need and not pinterest._stop_requested:
+                    try:
+                        pinterest.crawl(autobot_pin_dir)
+                        new_downloaded = len(pinterest.piclist) - downloaded_count
+                        if new_downloaded > 0:
+                            downloaded_count = len(pinterest.piclist)
+                        self.log_signal.emit(f"🖼️[Pinterest] Страница {page + 1}, всего скачано: {downloaded_count}")
+                        page += 1
+                        if downloaded_count >= need:
+                            break
+                        time.sleep(2)
+                    except Exception as e:
+                        self.log_signal.emit(f"🧰[Pinterest ERROR] {e}")
+                        break
+
+                pinterest.driver.quit()
+                self.log_signal.emit(f"🤙[Pinterest] Загружено {downloaded_count} изображений в 'autobotPin/'.")
+
+            except Exception as e:
+                self.log_signal.emit(f"💔[Autobot] Ошибка при загрузке с Pinterest: {e}")
+                if 'pinterest' in locals() and hasattr(pinterest, 'driver'):
+                    try:
+                        pinterest.driver.quit()
+                    except:
+                        pass
+
+        #4 Watermark для всех файлов в autobotPin/ (если указан путь к водяному знаку)
+        if os.path.exists(autobot_pin_dir) and os.listdir(autobot_pin_dir):
+            if self.wm_path and os.path.isfile(self.wm_path):
+                self.log_signal.emit("🖋️[Watermark] Накладываю водяной знак на новые изображения...")
+                wm_worker = WatermarkWorker(
+                    folder=autobot_pin_dir,
+                    watermark_path=self.wm_path,
+                    opacity=self.wm_opacity,
+                    size=self.wm_size,
+                    position=self.wm_position,
+                    bw=self.wm_bw
+                )
+                wm_worker.run()
+                self.log_signal.emit("🖋️[Watermark] Завершено.")
+            else:
+                self.log_signal.emit("⏭️[Watermark] Водяной знак не указан — пропускаю...")
+
+        #5 Перенос из autobotPin/ в main_folder/
+        moved_count = 0
+        if os.path.exists(autobot_pin_dir):
+            for filename in os.listdir(autobot_pin_dir):
+                src = os.path.join(autobot_pin_dir, filename)
+                dst = os.path.join(main_folder, filename)
+                if os.path.isfile(src):
+                    if not os.path.exists(dst):  #Не перезаписываем
+                        try:
+                            shutil.move(src, dst)
+                            moved_count += 1
+                        except Exception as e:
+                            self.log_signal.emit(f"🧰[ERROR] Не удалось переместить {filename}: {e}")
+                    else:
+                        #Если файл уже есть - удаляем дубликат из подпапки
+                        os.remove(src)
+            shutil.rmtree(autobot_pin_dir, ignore_errors=True)
+        self.log_signal.emit(f"🚚[Autobot] Перемещено {moved_count} файлов в основную папку.")
+
+        #6 рандомайзер имён в main_folder
+        self.log_signal.emit("🔀[Autobot] Рандомизация имён всех файлов...")
+        randomizer = RandomizerWorker(main_folder)
+        randomizer.run()  #синхронно
+        self.log_signal.emit("🔀[Autobot] Рандомизация завершена.")
+
+        #7 Anti-Dupe: только точные визуальные дубликаты - dupes/ - удаление dupes/
+        self.log_signal.emit("🔍[Autobot] Поиска визуальных дубликатов...")
+        exact_hashes = {}
+        duplicates_to_move = []
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
+
+        for filename in os.listdir(main_folder):
+            if filename.lower().endswith(image_extensions):
+                path = os.path.join(main_folder, filename)
+                h = get_normalized_image_hash(path)
+                if h:
+                    if h in exact_hashes:
+                        duplicates_to_move.append(path)
+                    else:
+                        exact_hashes[h] = path
+                else:
+                    self.log_signal.emit(f"🧰[WARN] Пропущен файл (ошибка хэширования): {filename}")
+
+        if duplicates_to_move:
+            dupes_dir = os.path.join(main_folder, "dupes")
+            os.makedirs(dupes_dir, exist_ok=True)
+            for dup_path in duplicates_to_move:
+                if os.path.exists(dup_path):
+                    basename = os.path.basename(dup_path)
+                    dest = os.path.join(dupes_dir, basename)
+                    counter = 1
+                    while os.path.exists(dest):
+                        name, ext = os.path.splitext(basename)
+                        dest = os.path.join(dupes_dir, f"{name}_{counter}{ext}")
+                        counter += 1
+                    try:
+                        shutil.move(dup_path, dest)
+                    except Exception as e:
+                        self.log_signal.emit(f"🧰[ERROR] Не удалось переместить дубликат: {e}")
+            self.log_signal.emit(f"🗂️[Autobot] Перемещено {len(duplicates_to_move)} дубликатов в 'dupes'.")
+
+            shutil.rmtree(dupes_dir, ignore_errors=True)
+            self.log_signal.emit("🧹[Autobot] Папка 'dupes' удалена.")
+        else:
+            self.log_signal.emit("👍[Autobot] Точных дубликатов не найдено.")
+
+        if duplicates_to_move:
+            os.makedirs(dupes_dir, exist_ok=True)
+            for dup_path in duplicates_to_move:
+                if os.path.exists(dup_path):
+                    basename = os.path.basename(dup_path)
+                    dest = os.path.join(dupes_dir, basename)
+                    counter = 1
+                    while os.path.exists(dest):
+                        name, ext = os.path.splitext(basename)
+                        dest = os.path.join(dupes_dir, f"{name}_{counter}{ext}")
+                        counter += 1
+                    try:
+                        shutil.move(dup_path, dest)
+                    except Exception as e:
+                        self.log_signal.emit(f"🧰[ERROR] Не удалось переместить дубликат: {e}")
+            self.log_signal.emit(f"🗂️[Autobot] Перемещено {len(duplicates_to_move)} дубликатов в 'dupes'.")
+
+            #Сразу удаляем папку dupes
+            shutil.rmtree(dupes_dir, ignore_errors=True)
+            self.log_signal.emit("🧹[Autobot] Папка 'dupes' удалена.")
+
+        #8 Bimbo Sorter в режиме автораспределения
+        self.log_signal.emit("💖[Bimbo] Запуск сортировки по цвету...")
+        bimbo_worker = BimboSorterWorker(
+            folder_path=main_folder,
+            auto_distribute=True
+        )
+        bimbo_worker.run()
+        self.log_signal.emit("💖[Bimbo] Сортировка завершена.")
+
+        #9 Автопостинг до 100 в отложке, каждые 10 постов проверка
+        self.log_signal.emit("📮[Autobot] Начинаю автопостинг...")
+
+        #Получаем список кластеров
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
+        images = [f for f in os.listdir(main_folder) if f.lower().endswith(image_extensions)]
+
+        from collections import defaultdict
+        clusters = defaultdict(list)
+        for img in images:
+            stem = Path(img).stem
+            if '_' in stem and stem.split('_')[0].isdigit():
+                cluster_id = stem.split('_')[0]
+                clusters[cluster_id].append(img)
+            else:
+                self.log_signal.emit(f"⚠️[SKIP] Пропущено (не формат кластера): {img}")
+
+        sorted_clusters = sorted(clusters.items(), key=lambda x: int(x[0]))
+        cluster_list = [batch for _, batch in sorted_clusters]
+
+        if not cluster_list:
+            self.log_signal.emit("📭[Autobot] Нет кластеров для публикации.")
+        else:
+            #Подключаемся к VK один раз
+            try:
+                vk_session = vk_api.VkApi(token=self.token)
+                vk = vk_session.get_api()
+            except Exception as e:
+                self.log_signal.emit(f"🧰[ERROR] Не удалось подключиться к ВК: {e}")
+                return
+
+            posted_count = 0
+            total_clusters = len(cluster_list)
+
+            for idx, photo_batch in enumerate(cluster_list, start=1):
+                if not self.running:
+                    self.log_signal.emit("🛑[Autobot] Остановлен пользователем.")
+                    break
+
+                #Публикуем один кластер
+                self.log_signal.emit(f"📬[Autobot] Пост №{idx} из {total_clusters}...")
+
+                media_ids = []
+                posted_folder = os.path.join(main_folder, "posted")
+                os.makedirs(posted_folder, exist_ok=True)
+
+                for photo_file in photo_batch:
+                    full_path = os.path.join(main_folder, photo_file)
+                    try:
+                        self.log_signal.emit(f"[📩] Загружаю {photo_file}")
+                        upload_server = vk.photos.getWallUploadServer(group_id=abs(int(self.group_id)))
+                        with open(full_path, 'rb') as f:
+                            response = requests.post(upload_server['upload_url'], files={'photo': f})
+                        result = response.json()
+                        saved = vk.photos.saveWallPhoto(
+                            group_id=abs(int(self.group_id)),
+                            server=result['server'],
+                            photo=result['photo'],
+                            hash=result['hash']
+                        )
+                        media_ids.append(f"photo{saved[0]['owner_id']}_{saved[0]['id']}")
+                        shutil.move(full_path, os.path.join(posted_folder, photo_file))
+                    except Exception as e:
+                        self.log_signal.emit(f"🧰[ERROR] Ошибка загрузки {photo_file}: {e}")
+
+                if not media_ids:
+                    self.log_signal.emit(f"😢[SKIP] Пост №{idx} пропущен (нет вложений).")
+                    continue
+
+                #Подпись
+                post_text = self.caption
+                if self.use_ai_caption:
+                    ai_quote = self.generate_ai_caption_simple()
+                    if ai_quote:
+                        post_text = f"{post_text}\n{ai_quote}" if post_text else ai_quote
+                if self.use_random_emoji and self.emoji_list:
+                    emoji = random.choice(self.emoji_list)
+                    post_text = f"{post_text}\n{emoji}" if post_text else emoji
+
+                #Получаем актуальное время
+                current_time = int(time.time())
+                post_time = current_time + (idx - 1) * self.interval_hours * 3600
+
+                #publish_date должен быть > текущего времени ВК
+                min_allowed_time = current_time + 60
+                if post_time < min_allowed_time:
+                    post_time = min_allowed_time
+                    self.log_signal.emit(f"[⚠️] Время поста №{idx} скорректировано на {datetime.fromtimestamp(post_time).strftime('%Y-%m-%d %H:%M')}")
+
+                try:
+                    vk.wall.post(
+                        owner_id=int(self.group_id),
+                        from_group=1,
+                        attachments=','.join(media_ids),
+                        publish_date=post_time,
+                        message=post_text if post_text.strip() else None,
+                        primary_attachments_mode='carousel' if self.use_carousel else 'grid'
+                    )
+                    self.log_signal.emit(f"[📅] Пост №{idx} запланирован.")
+                    posted_count += 1
+                    time.sleep(3)
+                except Exception as e:
+                    self.log_signal.emit(f"🧰[ERROR] Ошибка публикации поста №{idx}: {e}")
+                    continue
+
+                #🔁 Проверка каждые 10 постов
+                if posted_count % 10 == 0:
+                    delayed = self.check_delayed_count()
+                    self.log_signal.emit(f"📊[Autobot] После {posted_count} постов: отложка = {delayed}")
+                    if delayed >= 100: #порог отложки
+                        self.log_signal.emit("🛑[Autobot] Отложка достигла 100. Остановка.")
+                        break
+
+            self.log_signal.emit(f"👍[Autobot] Завершено. Всего опубликовано: {posted_count} постов. Следующая проверка через 5 часов.")
+
+    def stop(self):
+        self.running = False
+
+    def check_delayed_count(self):
+        try:
+            vk_session = vk_api.VkApi(token=self.token)
+            vk = vk_session.get_api()
+            offset = 0
+            count = 100
+            total = 0
+            while True:
+                response = vk.wall.get(owner_id=int(self.group_id), filter='postponed', count=count, offset=offset)
+                items = response.get('items', [])
+                if not items:
+                    break
+                total += len(items)
+                offset += count
+                time.sleep(0.3)
+            return total
+        except Exception as e:
+            self.log_signal.emit(f"🧰[ERROR] Не удалось проверить отложку: {e}")
+            return 0
 
 class BimboSorterWorker(QThread):
     log_signal = Signal(str)
@@ -1022,7 +1393,7 @@ class Pinterest:
         pickle.dump(cookies, open("cookies.pkl", "wb"))
         
     def stop(self):
-        """Запрос на остановку загрузки."""
+        #Запрос на остановку загрузки
         self._stop_requested = True
 
     def crawl(self, dir_path):
@@ -1380,7 +1751,7 @@ class RandomizerWorker(QThread):
 
     def run(self):
         try:
-            script_name = os.path.basename(sys.argv[0])  # Имя самого запущенного скрипта
+            script_name = os.path.basename(sys.argv[0])  #Имя самого запущенного скрипта
             files = [f for f in os.listdir(self.folder_path) if os.path.isfile(os.path.join(self.folder_path, f))]
 
             self.log_signal.emit(f"[🔎] Найдено {len(files)} файлов для переименования.")
@@ -1924,6 +2295,10 @@ class VKAutoPosterApp(QWidget):
         self.duplicates_ui(duplicates_tab)
         self.tabs.addTab(duplicates_tab, "Anti-Dupe")
         
+        autobot_tab = QWidget()
+        self.autobot_ui(autobot_tab)
+        self.tabs.addTab(autobot_tab, "Autobot")
+        
         credits_tab = QWidget()
         self.credits_ui(credits_tab)
         self.tabs.addTab(credits_tab, "Credits")
@@ -2026,7 +2401,7 @@ class VKAutoPosterApp(QWidget):
         btn_layout.addWidget(self.pin_stop_btn)
         form_layout.addLayout(btn_layout)
 
-        # Логотип внизу
+        #Логотип внизу
         spacer = QLabel()
         spacer.setFixedHeight(150)
         form_layout.addWidget(spacer)
@@ -2441,6 +2816,197 @@ class VKAutoPosterApp(QWidget):
     def append_duplicates_log(self, text):
         self.dup_log_area.append(text)
         
+    def autobot_ui(self, tab):
+        layout = QHBoxLayout(tab)
+        form_widget = QWidget()
+        form_layout = QVBoxLayout(form_widget)
+        form_layout.setSpacing(10)
+        form_layout.setContentsMargins(10, 10, 10, 10)
+
+        #Подгрузка конфига
+        config = load_config()
+
+        #Токен ВК
+        token_label = QLabel('<a href="https://vkhost.github.io/" style="color: #668eff; text-decoration: none;">Токен API:</a>')
+        token_label.setOpenExternalLinks(False)
+        token_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(QtCore.QUrl(link)))
+        form_layout.addWidget(token_label)
+        self.autobot_token_input = QLineEdit(config.get("token", ""))
+        self.autobot_token_input.setEchoMode(QLineEdit.Password)
+        token_eye_btn = QPushButton("👁️")
+        token_eye_btn.setObjectName("eyeButton")
+        token_eye_btn.setFixedSize(30, 30)
+        token_eye_btn.enterEvent = lambda e: self.autobot_token_input.setEchoMode(QLineEdit.Normal)
+        token_eye_btn.leaveEvent = lambda e: self.autobot_token_input.setEchoMode(QLineEdit.Password)
+        token_layout = QHBoxLayout()
+        token_layout.addWidget(self.autobot_token_input)
+        token_layout.addWidget(token_eye_btn)
+        form_layout.addLayout(token_layout)
+
+        #ID сообщества
+        form_layout.addWidget(QLabel("ID сообщества:"))
+        self.autobot_group_input = QLineEdit(config.get("group_id", ""))
+        form_layout.addWidget(self.autobot_group_input)
+
+        #Интервал (часы)
+        form_layout.addWidget(QLabel("Интервал постов (в часах):"))
+        self.autobot_interval_input = QLineEdit("2")
+        form_layout.addWidget(self.autobot_interval_input)
+
+        #Pinterest
+        form_layout.addWidget(QLabel("Pinterest логин:"))
+        self.autobot_pin_email = QLineEdit()
+        form_layout.addWidget(self.autobot_pin_email)
+        form_layout.addWidget(QLabel("Pinterest пароль:"))
+        self.autobot_pin_password = QLineEdit()
+        self.autobot_pin_password.setEchoMode(QLineEdit.Password)
+        pin_eye_btn = QPushButton("👁️")
+        pin_eye_btn.setObjectName("eyeButton")
+        pin_eye_btn.setFixedSize(30, 30)
+        pin_eye_btn.enterEvent = lambda e: self.autobot_pin_password.setEchoMode(QLineEdit.Normal)
+        pin_eye_btn.leaveEvent = lambda e: self.autobot_pin_password.setEchoMode(QLineEdit.Password)
+        pin_pass_layout = QHBoxLayout()
+        pin_pass_layout.addWidget(self.autobot_pin_password)
+        pin_pass_layout.addWidget(pin_eye_btn)
+        form_layout.addLayout(pin_pass_layout)
+
+        hint_label = QLabel("Логин/пароль требуется только при первом входе")
+        hint_label.setStyleSheet("color: rgba(255, 255, 255, 160); font-size: 11px;")
+        form_layout.addWidget(hint_label)
+
+        #Подпись
+        form_layout.addWidget(QLabel("Подпись к постам:"))
+        self.autobot_caption = QLineEdit()
+        form_layout.addWidget(self.autobot_caption)
+
+        #Чекбоксы
+        self.autobot_random_emoji = QCheckBox("Рандомизировать эмодзи")
+        form_layout.addWidget(self.autobot_random_emoji)
+        self.autobot_carousel = QCheckBox("Карусель")
+        form_layout.addWidget(self.autobot_carousel)
+        self.autobot_ai_caption = QCheckBox("ИИ подписи")
+
+        #ИИ + промпт
+        ai_layout = QHBoxLayout()
+        ai_layout.addWidget(self.autobot_ai_caption)
+        ai_prompt_label = QLabel('<a href="#" style="font-size: 70%; color: #668eff;">Редактировать промпт</a>')
+        ai_prompt_label.setOpenExternalLinks(False)
+        ai_prompt_label.linkActivated.connect(self.open_prompt_editor)
+        ai_layout.addWidget(ai_prompt_label)
+        ai_layout.addStretch()
+        form_layout.addLayout(ai_layout)
+
+        #Mistral API
+        mistral_label = QLabel('<a href="https://console.mistral.ai/home" style="color: #668eff; text-decoration: none;">Mistral API ключ:</a>')
+        mistral_label.setOpenExternalLinks(False)
+        mistral_label.linkActivated.connect(lambda link: QtGui.QDesktopServices.openUrl(QtCore.QUrl(link)))
+        form_layout.addWidget(mistral_label)
+        self.autobot_mistral_key = QLineEdit(config.get("mistral_api_key", ""))
+        self.autobot_mistral_key.setEchoMode(QLineEdit.Password)
+        mistral_eye_btn = QPushButton("👁️")
+        mistral_eye_btn.setObjectName("eyeButton")
+        mistral_eye_btn.setFixedSize(30, 30)
+        mistral_eye_btn.enterEvent = lambda e: self.autobot_mistral_key.setEchoMode(QLineEdit.Normal)
+        mistral_eye_btn.leaveEvent = lambda e: self.autobot_mistral_key.setEchoMode(QLineEdit.Password)
+        mistral_layout = QHBoxLayout()
+        mistral_layout.addWidget(self.autobot_mistral_key)
+        mistral_layout.addWidget(mistral_eye_btn)
+        form_layout.addLayout(mistral_layout)
+
+        #Папка с фото
+        form_layout.addWidget(QLabel("Папка с изображениями для постов:"))
+        self.autobot_photos_folder = QLineEdit()
+        default_photos = os.path.join(os.path.dirname(sys.argv[0]), "photos")
+        self.autobot_photos_folder.setText(default_photos)
+        self.autobot_folder_btn = QPushButton("📁 Выбрать папку")
+        self.autobot_folder_btn.clicked.connect(self.select_autobot_photos_folder)
+        form_layout.addWidget(self.autobot_photos_folder)
+        form_layout.addWidget(self.autobot_folder_btn)
+
+        #Watermark группа
+        form_layout.addWidget(QLabel("Водяной знак:"))
+
+        self.autobot_wm_path = ""
+        self.autobot_wm_label = QLabel("Изображение водяного знака: не выбрано")
+        form_layout.addWidget(self.autobot_wm_label)
+        self.autobot_wm_btn = QPushButton("Выбрать водяной знак")
+        self.autobot_wm_btn.clicked.connect(self.select_autobot_wm)
+        form_layout.addWidget(self.autobot_wm_btn)
+
+        #Непрозрачность
+        self.autobot_opacity_slider = QSlider(Qt.Horizontal)
+        self.autobot_opacity_slider.setRange(0, 100)
+        self.autobot_opacity_slider.setValue(32)
+        self.autobot_opacity_label = QLabel("Непрозрачность: 32%")
+        self.autobot_opacity_slider.valueChanged.connect(lambda v: self.autobot_opacity_label.setText(f"Непрозрачность: {v}%"))
+        form_layout.addWidget(self.autobot_opacity_slider)
+        form_layout.addWidget(self.autobot_opacity_label)
+
+        #Размер
+        form_layout.addWidget(QLabel("Размер водяного знака (px):"))
+        self.autobot_wm_size = QLineEdit("100")
+        form_layout.addWidget(self.autobot_wm_size)
+
+        #Позиция
+        pos_group = QWidget()
+        pos_layout = QVBoxLayout(pos_group)
+        pos_layout.addWidget(QLabel("Расположение:"))
+        pos_grid = QGridLayout()
+        self.autobot_wm_pos = {}
+        positions = ["top-left", "top-right", "bottom-left", "bottom-right"]
+        for i, pos in enumerate(positions):
+            rb = QRadioButton()
+            rb.setFixedSize(17, 17)
+            rb.setStyleSheet("""
+                QRadioButton::indicator {
+                    width: 14px;
+                    height: 14px;
+                    border: 1px solid #668eff;
+                    background: #2e2e2e;
+                }
+                QRadioButton::indicator:checked {
+                    background: #668eff;
+                }
+            """)
+            self.autobot_wm_pos[pos] = rb
+            row, col = divmod(i, 2)
+            pos_grid.addWidget(rb, row, col, Qt.AlignCenter)
+        self.autobot_wm_pos["top-right"].setChecked(True)
+        pos_layout.addLayout(pos_grid)
+        form_layout.addWidget(pos_group)
+
+        #ЧБ
+        self.autobot_wm_bw = QCheckBox("Черно-белый водяной знак")
+        form_layout.addWidget(self.autobot_wm_bw)
+
+        #Кнопки управления
+        self.autobot_start_btn = QPushButton("▶️ Запустить Autobot")
+        self.autobot_start_btn.clicked.connect(self.start_autobot)
+        form_layout.addWidget(self.autobot_start_btn)
+
+        self.autobot_stop_btn = QPushButton("⏹️ Остановить")
+        self.autobot_stop_btn.clicked.connect(self.stop_autobot)
+        self.autobot_stop_btn.setEnabled(False)
+        form_layout.addWidget(self.autobot_stop_btn)
+
+        form_layout.addStretch()
+        form_widget.setFixedWidth(360)
+
+        #Лог-область справа
+        self.autobot_log_area = QTextEdit()
+        self.autobot_log_area.setReadOnly(True)
+        self.autobot_log_area.setStyleSheet("""
+            background-color: #1e1e1e;
+            color: #cccccc;
+            border: 1px solid #444;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        """)
+        self.autobot_log_area.setFixedWidth(450)
+
+        layout.addWidget(form_widget)
+        layout.addWidget(self.autobot_log_area)
+        
     def credits_ui(self, tab):
         layout = QVBoxLayout(tab)
         layout.setAlignment(Qt.AlignCenter)
@@ -2701,20 +3267,32 @@ class VKAutoPosterApp(QWidget):
         self.downloader_log_area.append(text)
         
     def select_wm_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку с изображениями")
+        folder = QFileDialog.getExistingDirectory(self, "Выбери папку с изображениями")
         if folder:
             self.wm_folder = folder
             self.wm_label_folder.setText(f"Папка с изображениями: {folder}")
 
     def select_wm_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите изображение водяного знака",
+        path, _ = QFileDialog.getOpenFileName(self, "Выбери изображение водяного знака",
                                               "", "Изображения (*.png *.jpg *.jpeg *.bmp)")
         if path:
             self.wm_path = path
             self.wm_label_watermark.setText(f"Изображение водяного знака: {path}")
+            
+    def select_autobot_photos_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку с изображениями для постов")
+        if folder:
+            self.autobot_photos_folder.setText(folder)
+
+    def select_autobot_wm(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выбери изображение водяного знака",
+                                              "", "Изображения (*.png *.jpg *.jpeg *.bmp)")
+        if path:
+            self.autobot_wm_path = path
+            self.autobot_wm_label.setText(f"Изображение водяного знака: {path}")
 
     def select_randomizer_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для рандомизации имён")
+        folder = QFileDialog.getExistingDirectory(self, "Выбери папку для рандомизации имён")
         if folder:
             self.randomizer_folder = folder
             self.randomizer_label_folder.setText(f"Папка для рандомизации имён: {folder}")
@@ -2861,6 +3439,74 @@ class VKAutoPosterApp(QWidget):
             datetime.fromtimestamp(t + 7200)
         ))
         self.worker.start()
+        
+    def start_autobot(self):
+        #Валидация
+        token = self.autobot_token_input.text().strip()
+        group_id = self.autobot_group_input.text().strip()
+        main_folder = self.autobot_photos_folder.text().strip()
+        wm_path = self.autobot_wm_path
+        if not token or not group_id:
+            QMessageBox.critical(self, "Ошибка", "Заполните токен и ID группы.")
+            return
+        if not os.path.isdir(main_folder):
+            QMessageBox.critical(self, "Ошибка", "Укажите корректную папку с изображениями.")
+            return
+        # Водяной знак опционален, если не указан, wm_path останется пустым
+
+        #Подготовка параметров
+        try:
+            interval_hours = float(self.autobot_interval_input.text().strip())
+        except ValueError:
+            interval_hours = 2.0
+
+        #Положение вотермарки
+        wm_pos = "top-right"
+        for pos, rb in self.autobot_wm_pos.items():
+            if rb.isChecked():
+                wm_pos = pos
+                break
+
+        self.autobot_start_btn.setEnabled(False)
+        self.autobot_stop_btn.setEnabled(True)
+
+        self.autobot_worker = AutobotWorker(
+            token=token,
+            group_id=group_id,
+            interval_hours=interval_hours,
+            main_folder=main_folder,
+            pin_email=self.autobot_pin_email.text().strip(),
+            pin_password=self.autobot_pin_password.text().strip(),
+            caption=self.autobot_caption.text().strip(),
+            use_random_emoji=self.autobot_random_emoji.isChecked(),
+            use_carousel=self.autobot_carousel.isChecked(),
+            use_ai_caption=self.autobot_ai_caption.isChecked(),
+            mistral_api_key=self.autobot_mistral_key.text().strip(),
+            ai_prompt=self.current_ai_prompt,
+            wm_path=wm_path,
+            wm_opacity=self.autobot_opacity_slider.value(),
+            wm_size=int(self.autobot_wm_size.text()),
+            wm_position=wm_pos,
+            wm_bw=self.autobot_wm_bw.isChecked(),
+            emoji_list=self.emoji_list
+        )
+        self.autobot_worker.log_signal.connect(self.append_autobot_log)
+        self.autobot_worker.finished_signal.connect(self.on_autobot_finished)
+        self.autobot_worker.start()
+
+    def stop_autobot(self):
+        if hasattr(self, 'autobot_worker') and self.autobot_worker.isRunning():
+            self.autobot_worker.stop()
+            self.autobot_stop_btn.setEnabled(False)
+
+    def on_autobot_finished(self):
+        self.autobot_start_btn.setEnabled(True)
+        self.autobot_stop_btn.setEnabled(False)
+
+    @Slot(str)
+    def append_autobot_log(self, text):
+        self.autobot_log_area.append(text)
+        self.autobot_log_area.verticalScrollBar().setValue(self.autobot_log_area.verticalScrollBar().maximum())
 
     def check_delayed(self):
         token = self.token_input.text().strip()
@@ -2886,7 +3532,7 @@ class VKAutoPosterApp(QWidget):
         token = self.token_input.text().strip()
         group_id = self.group_input.text().strip()
         if not token or not group_id:
-            QMessageBox.critical(self, "Ошибка", "Заполните оба поля.")
+            QMessageBox.critical(self, "Ошибка", "Заполни оба поля.")
             return
         try:
             group_id_int = int(group_id)
@@ -2894,8 +3540,38 @@ class VKAutoPosterApp(QWidget):
                 group_id_int = -group_id_int
             group_id = str(group_id_int)
         except ValueError:
-            QMessageBox.critical(self, "Ошибка", "ID должно быть числом.")
+            QMessageBox.critical(self, "Ошибка", "ID должен быть числом.")
             return
+
+        confirm_dialog = QtWidgets.QDialog(self)
+        confirm_dialog.setWindowTitle("Подтверждение")
+        confirm_dialog.setFixedSize(300, 120)  #размер окна
+
+        layout = QVBoxLayout(confirm_dialog)
+
+        label = QLabel("Ты уверен?")
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("font-size: 16px;")
+
+        button_box = QHBoxLayout()
+        yes_btn = QPushButton("Да")
+        no_btn = QPushButton("Нет")
+
+        yes_btn.setStyleSheet("background-color: #ff4444; color: white; padding: 5px;")
+        no_btn.setStyleSheet("background-color: #444444; color: white; padding: 5px;")
+
+        yes_btn.clicked.connect(confirm_dialog.accept)
+        no_btn.clicked.connect(confirm_dialog.reject)
+
+        button_box.addWidget(yes_btn)
+        button_box.addWidget(no_btn)
+
+        layout.addWidget(label)
+        layout.addLayout(button_box)
+
+        if confirm_dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+
         self.clear_button.setEnabled(False)
         self.clear_worker = CheckAndClearWorker(token, group_id, action="clear")
         self.clear_worker.log_signal.connect(self.append_log)
